@@ -1,5 +1,5 @@
 
-name: CampusPrint CI
+name: CampusPrint CI/CD
 
 on:
   push:
@@ -40,10 +40,14 @@ jobs:
           push: false
           tags: campusprint:ci-test
 
-  publish-image:
+  publish-and-deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -62,7 +66,46 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }}
 
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::596717728680:role/CampusPrintGitHubActionsDeployRole
+          aws-region: us-east-1
 
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --name campusprint-eks \
+            --region us-east-1
+
+      - name: Enable rolling deployments
+        run: |
+          kubectl patch deployment campusprint \
+            -n default \
+            --type=merge \
+            -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+
+      - name: Deploy CampusPrint
+        run: |
+          kubectl set image deployment/campusprint \
+            campusprint=${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }} \
+            -n default
+
+      - name: Verify deployment rollout
+        run: |
+          kubectl rollout status deployment/campusprint \
+            -n default \
+            --timeout=240s
+          kubectl get deployment campusprint -n default
+          kubectl get pods -n default -l app=campusprint
+     
 
