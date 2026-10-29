@@ -1,4 +1,3 @@
-
 name: CampusPrint CI/CD
 
 on:
@@ -43,7 +42,8 @@ jobs:
   publish-and-deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-and-test
-    runs-on: ubuntu-latest
+    runs-on:
+      - codebuild-campusprint-gha-runner-${{ github.run_id }}-${{ github.run_attempt }}
     permissions:
       contents: read
       id-token: write
@@ -107,5 +107,3 @@ jobs:
             --timeout=240s
           kubectl get deployment campusprint -n default
           kubectl get pods -n default -l app=campusprint
-     
-
