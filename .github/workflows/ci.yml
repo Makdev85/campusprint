@@ -1,3 +1,100 @@
+name: CampusPrint CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: campusprint-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # STAGE 1: BUILD AND TEST
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript check
+        run: bun run lint
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Docker image build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: campusprint:ci-test
+
+  # STAGE 2: PUBLISH TO DOCKER HUB
+  publish:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push CampusPrint image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }}
+
+  # STAGE 3: DEPLOY TO AWS EKS
+  deploy:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::596717728680:role/CampusPrintGitHubActionsDeployRole
+          aws-region: us-east-1
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
 
       - name: Allow runner IP, deploy and restore EKS allowlist
         env:
@@ -14,12 +111,14 @@
 
           ORIGINAL_FILE="/tmp/eks-original.json"
           UPDATED_FILE="/tmp/eks-updated.json"
-          ALLOWLIST_CHANGED=false
+          UPDATE_ID=""
+          RESTORE_REQUIRED=false
 
           wait_for_update() {
             local update_id="$1"
 
             for attempt in $(seq 1 60); do
+              local status
               status=$(aws eks describe-update \
                 --name "$CLUSTER" \
                 --region "$REGION" \
@@ -47,19 +146,17 @@
           restore_allowlist() {
             echo "Checking whether original allowlist needs restoration..."
 
-            CURRENT_FILE="/tmp/eks-current.json"
-
             aws eks describe-cluster \
               --name "$CLUSTER" \
               --region "$REGION" \
               --query 'cluster.resourcesVpcConfig' \
-              --output json > "$CURRENT_FILE"
+              --output json > /tmp/eks-current.json
 
             jq '{
               endpointPublicAccess: .endpointPublicAccess,
               endpointPrivateAccess: .endpointPrivateAccess,
               publicAccessCidrs: (.publicAccessCidrs | sort)
-            }' "$CURRENT_FILE" > /tmp/current-normalized.json
+            }' /tmp/eks-current.json > /tmp/current-normalized.json
 
             jq '{
               endpointPublicAccess: .endpointPublicAccess,
@@ -72,23 +169,31 @@
               return 0
             fi
 
-            RESTORE_ID=$(aws eks update-cluster-config \
+            echo "Restoring original EKS allowlist..."
+
+            local restore_id
+            restore_id=$(aws eks update-cluster-config \
               --name "$CLUSTER" \
               --region "$REGION" \
               --resources-vpc-config "file://$ORIGINAL_FILE" \
               --query 'update.id' \
               --output text)
 
-            wait_for_update "$RESTORE_ID"
+            wait_for_update "$restore_id"
           }
 
           cleanup() {
-            exit_code=$?
+            local exit_code=$?
             trap - EXIT
 
-            if [[ "$ALLOWLIST_CHANGED" == true ]]; then
+            if [[ "$RESTORE_REQUIRED" == true ]]; then
+              if [[ -n "$UPDATE_ID" ]]; then
+                echo "Waiting for the initial EKS update to finish..."
+                wait_for_update "$UPDATE_ID" || true
+              fi
+
               restore_allowlist || {
-                echo "WARNING: Could not restore original EKS allowlist."
+                echo "::error::Could not restore original EKS allowlist."
                 exit_code=1
               }
             fi
@@ -102,7 +207,7 @@
           RUNNER_IP=$(curl -4fsS https://checkip.amazonaws.com | tr -d '\n')
           echo "GitHub runner IP: $RUNNER_IP"
 
-          # Save original endpoint settings.
+          # Save original EKS endpoint settings.
           aws eks describe-cluster \
             --name "$CLUSTER" \
             --region "$REGION" \
@@ -115,13 +220,13 @@
             publicAccessCidrs: .publicAccessCidrs
           }' /tmp/eks-vpc.json > "$ORIGINAL_FILE"
 
-          # Add runner IP.
+          # Add runner IP without removing existing IPs.
           jq --arg cidr "$RUNNER_IP/32" \
             '.publicAccessCidrs |= ((. + [$cidr]) | unique)' \
             "$ORIGINAL_FILE" > "$UPDATED_FILE"
 
           if ! cmp -s "$ORIGINAL_FILE" "$UPDATED_FILE"; then
-            ALLOWLIST_CHANGED=true
+            RESTORE_REQUIRED=true
 
             UPDATE_ID=$(aws eks update-cluster-config \
               --name "$CLUSTER" \
