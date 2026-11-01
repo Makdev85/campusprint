@@ -1,66 +1,72 @@
 name: CampusPrint CI/CD
-
+ 
+# CI builds, tests, and pushes the image to Docker Hub.
+# Deployment is NOT done from CI: an in-cluster updater (Keel, once installed)
+# pulls new images. Until it is installed, pushes will not update the running app.
+ 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
-
+ 
 permissions:
   contents: read
-
+ 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+ 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-
+ 
       - name: Install dependencies
         run: bun install --frozen-lockfile
-
+ 
       - name: TypeScript check
         run: bun run lint
-
+ 
       - name: Build frontend
         run: bun run build
-
+ 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
+ 
       - name: Validate Docker image build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           tags: campusprint:ci-test
-
-  publish-and-deploy:
+ 
+  publish:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: build-and-test
-    runs-on:
-      - codebuild-campusprint-gha-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
-
+    # Serialize publishes so an older build can never overwrite a newer :latest
+    concurrency:
+      group: publish-image
+      cancel-in-progress: false
+ 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+ 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
+ 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
+ 
       - name: Build and push CampusPrint image
         uses: docker/build-push-action@v6
         with:
@@ -69,41 +75,4 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }}
-
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::596717728680:role/CampusPrintGitHubActionsDeployRole
-          aws-region: us-east-1
-
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: v1.34.0
-
-      - name: Configure EKS access
-        run: |
-          aws eks update-kubeconfig \
-            --name campusprint-eks \
-            --region us-east-1
-
-      - name: Enable rolling deployments
-        run: |
-          kubectl patch deployment campusprint \
-            -n default \
-            --type=merge \
-            -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
-
-      - name: Deploy CampusPrint
-        run: |
-          kubectl set image deployment/campusprint \
-            campusprint=${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }} \
-            -n default
-
-      - name: Verify deployment rollout
-        run: |
-          kubectl rollout status deployment/campusprint \
-            -n default \
-            --timeout=240s
-          kubectl get deployment campusprint -n default
-          kubectl get pods -n default -l app=campusprint
+ 
