@@ -1,72 +1,72 @@
+
 name: CampusPrint CI/CD
- 
-# CI builds, tests, and pushes the image to Docker Hub.
-# Deployment is NOT done from CI: an in-cluster updater (Keel, once installed)
-# pulls new images. Until it is installed, pushes will not update the running app.
- 
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
- 
+
 permissions:
   contents: read
- 
+
+# Prevent overlapping deployments of the same branch.
+concurrency:
+  group: campusprint-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+
+  # STAGE 1: BUILD AND TEST
   build-and-test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
- 
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
- 
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
- 
+
       - name: TypeScript check
         run: bun run lint
- 
+
       - name: Build frontend
         run: bun run build
- 
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
- 
+
       - name: Validate Docker image build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           tags: campusprint:ci-test
- 
+
+  # STAGE 2: PUBLISH TO DOCKER HUB
   publish:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: build-and-test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    # Serialize publishes so an older build can never overwrite a newer :latest
-    concurrency:
-      group: publish-image
-      cancel-in-progress: false
- 
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
- 
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
- 
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
- 
+
       - name: Build and push CampusPrint image
         uses: docker/build-push-action@v6
         with:
@@ -75,4 +75,156 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/campusprint:${{ github.sha }}
- 
+
+  # STAGE 3: DEPLOY TO AWS EKS
+  deploy:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::596717728680:role/CampusPrintGitHubActionsDeployRole
+          aws-region: us-east-1
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
+
+      - name: Allow runner IP, deploy and restore EKS allowlist
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          CLUSTER="campusprint-eks"
+          REGION="us-east-1"
+          NAMESPACE="default"
+          DEPLOYMENT="campusprint"
+          IMAGE="${DOCKERHUB_USERNAME}/campusprint:${GITHUB_SHA}"
+
+          ALLOWLIST_CHANGED=false
+
+          wait_for_update() {
+            local update_id="$1"
+
+            echo "Waiting for EKS update: $update_id"
+
+            for attempt in $(seq 1 60); do
+              status=$(aws eks describe-update \
+                --name "$CLUSTER" \
+                --region "$REGION" \
+                --update-id "$update_id" \
+                --query 'update.status' \
+                --output text)
+
+              echo "EKS update status: $status"
+
+              if [[ "$status" == "Successful" ]]; then
+                return 0
+              fi
+
+              if [[ "$status" == "Failed" ]]; then
+                echo "EKS update failed."
+                return 1
+              fi
+
+              sleep 20
+            done
+
+            echo "Timed out waiting for EKS update."
+            return 1
+          }
+
+          cleanup() {
+            exit_code=$?
+            trap - EXIT
+
+            if [[ "$ALLOWLIST_CHANGED" == true ]]; then
+              echo "Restoring original EKS IP allowlist..."
+
+              RESTORE_ID=$(aws eks update-cluster-config \
+                --name "$CLUSTER" \
+                --region "$REGION" \
+                --resources-vpc-config file:///tmp/eks-original.json \
+                --query 'update.id' \
+                --output text) || exit_code=1
+
+              if [[ -n "${RESTORE_ID:-}" ]]; then
+                wait_for_update "$RESTORE_ID" || exit_code=1
+              fi
+            fi
+
+            exit "$exit_code"
+          }
+
+          trap cleanup EXIT
+
+          # Get current runner public IP.
+          RUNNER_IP=$(curl -4fsS https://checkip.amazonaws.com | tr -d '\n')
+          echo "GitHub runner IP: $RUNNER_IP"
+
+          if [[ ! "$RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid runner IP."
+            exit 1
+          fi
+
+          # Save original endpoint configuration.
+          aws eks describe-cluster \
+            --name "$CLUSTER" \
+            --region "$REGION" \
+            --query 'cluster.resourcesVpcConfig' \
+            --output json > /tmp/eks-vpc.json
+
+          jq '{
+            endpointPublicAccess: .endpointPublicAccess,
+            endpointPrivateAccess: .endpointPrivateAccess,
+            publicAccessCidrs: .publicAccessCidrs
+          }' /tmp/eks-vpc.json > /tmp/eks-original.json
+
+          # Add only this runner's IP, preserving existing entries.
+          jq --arg cidr "$RUNNER_IP/32" \
+            '.publicAccessCidrs |= ((. + [$cidr]) | unique)' \
+            /tmp/eks-original.json > /tmp/eks-updated.json
+
+          if ! cmp -s /tmp/eks-original.json /tmp/eks-updated.json; then
+            UPDATE_ID=$(aws eks update-cluster-config \
+              --name "$CLUSTER" \
+              --region "$REGION" \
+              --resources-vpc-config file:///tmp/eks-updated.json \
+              --query 'update.id' \
+              --output text)
+
+            ALLOWLIST_CHANGED=true
+            wait_for_update "$UPDATE_ID"
+          else
+            echo "Runner IP already allowlisted."
+          fi
+
+          # Configure Kubernetes access.
+          aws eks update-kubeconfig \
+            --name "$CLUSTER" \
+            --region "$REGION"
+
+          # Deploy exact image from this GitHub commit.
+          kubectl set image \
+            deployment/"$DEPLOYMENT" \
+            campusprint="$IMAGE" \
+            -n "$NAMESPACE"
+
+          # Verify Kubernetes deployment.
+          kubectl rollout status \
+            deployment/"$DEPLOYMENT" \
+            -n "$NAMESPACE" \
+            --timeout=5m
+
+          echo "CampusPrint deployment successful: $IMAGE"
