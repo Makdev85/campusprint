@@ -8,6 +8,12 @@ export default function App() {
     <PrintKioskProvider>
       <div className="min-h-screen bg-white text-slate-900 flex flex-col font-sans">
         <Navbar />
+        <div
+          className="border-y border-emerald-200 bg-emerald-50 px-4 py-3 text-center text-sm font-semibold text-emerald-800"
+          role="status"
+        >
+          CI/CD Deployment Demo — Version 2
+        </div>
 
         <main className="flex-1">
           <LinearXeroxWorkflow />
