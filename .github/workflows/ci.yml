@@ -270,12 +270,12 @@ jobs:
     if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
 
     steps:      
-      - name: Send pipeline status to Slack
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          payload: >
-            {
-              "text": "CampusPrint CI/CD — ${{ (needs.build-and-test.result == 'success' && needs.publish.result == 'success' && needs.deploy.result == 'success') && 'SUCCESS' || 'FAILED' }} (Repo: ${{ github.repository }} | Run: ${{ github.run_id }})"
-            }
+      - name: Send pipeline status to Slack via cURL
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ (needs.build-and-test.result == 'success' && needs.publish.result == 'success' && needs.deploy.result == 'success') && 'SUCCESS' || 'FAILED' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"CampusPrint CI/CD — $STATUS\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nCommit: ${{ github.sha }}\n\nBuild & Test: ${{ needs.build-and-test.result }}\nPublish: ${{ needs.publish.result }}\nDeploy: ${{ needs.deploy.result }}\n\n<$RUN_URL|View GitHub Actions Run>\"}" \
+          "$SLACK_WEBHOOK_URL"
