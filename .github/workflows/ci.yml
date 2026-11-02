@@ -259,7 +259,7 @@ jobs:
 
           echo "CampusPrint deployed successfully: $IMAGE"
           
-  # STAGE 4: SLACK NOTIFICATIONS
+# STAGE 4: SLACK NOTIFICATIONS
   notify-slack:
     name: Notify Slack
     runs-on: ubuntu-latest
@@ -270,13 +270,10 @@ jobs:
     if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
 
     steps:      
-    - name: Send pipeline status to Slack
-      uses: slackapi/slack-github-action@v2.1.1
-      with:
+      - name: Send pipeline status to Slack
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          retries: 0
-          errors: true
           payload: |
             {
               "text": "CampusPrint CI/CD — ${{ (needs.build-and-test.result == 'success' && needs.publish.result == 'success' && needs.deploy.result == 'success') && 'SUCCESS' || 'FAILED' }}\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nCommit: ${{ github.sha }}\n\nBuild & Test: ${{ needs.build-and-test.result }}\nPublish: ${{ needs.publish.result }}\nDeploy: ${{ needs.deploy.result }}\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View GitHub Actions Run>"
