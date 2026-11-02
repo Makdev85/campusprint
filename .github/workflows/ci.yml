@@ -259,7 +259,8 @@ jobs:
 
           echo "CampusPrint deployed successfully: $IMAGE"
           
-# STAGE 4: SLACK NOTIFICATIONS
+
+  # STAGE 4: SLACK NOTIFICATIONS
   notify-slack:
     name: Notify Slack
     runs-on: ubuntu-latest
@@ -269,13 +270,56 @@ jobs:
       - deploy
     if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
 
-    steps:      
-      - name: Send pipeline status to Slack via cURL
+    steps:
+      - name: Send pipeline status to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           STATUS: ${{ (needs.build-and-test.result == 'success' && needs.publish.result == 'success' && needs.deploy.result == 'success') && 'SUCCESS' || 'FAILED' }}
+          BUILD_STATUS: ${{ needs.build-and-test.result }}
+          PUBLISH_STATUS: ${{ needs.publish.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.result }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        shell: bash
         run: |
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\"CampusPrint CI/CD — $STATUS\nRepository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nCommit: ${{ github.sha }}\n\nBuild & Test: ${{ needs.build-and-test.result }}\nPublish: ${{ needs.publish.result }}\nDeploy: ${{ needs.deploy.result }}\n\n<$RUN_URL|View GitHub Actions Run>\"}" \
-          "$SLACK_WEBHOOK_URL"
+          set -euo pipefail
+
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            echo "::error::SLACK_WEBHOOK_URL secret is missing."
+            exit 1
+          fi
+
+          MESSAGE=$(printf '%s\n' \
+            "CampusPrint CI/CD — $STATUS" \
+            "" \
+            "Repository: $REPOSITORY" \
+            "Branch: $BRANCH" \
+            "Commit: $COMMIT" \
+            "" \
+            "Build & Test: $BUILD_STATUS" \
+            "Publish: $PUBLISH_STATUS" \
+            "Deploy: $DEPLOY_STATUS" \
+            "" \
+            "View GitHub Actions Run: $RUN_URL")
+
+          PAYLOAD=$(jq -n --arg text "$MESSAGE" '{text: $text}')
+
+          echo "Sending CampusPrint notification to Slack..."
+
+          RESPONSE=$(curl --silent --show-error --fail-with-body \
+            -X POST \
+            -H 'Content-type: application/json' \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL")
+
+          echo "Slack response: $RESPONSE"
+
+          if [[ "$RESPONSE" != "ok" ]]; then
+            echo "::error::Slack did not confirm message delivery."
+            exit 1
+          fi
+
+          echo "CampusPrint Slack notification delivered successfully."
